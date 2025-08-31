@@ -1,0 +1,24 @@
+# 🔐 Secrets
+.env
+
+# 💻 Python
+__pycache__/
+*.pyc
+
+# 🐍 Virtual environments
+venv/
+.env/  # if virtualenv uses this
+
+# 📦 VS Code / JetBrains / IDEs
+.vscode/
+.idea/
+
+# 🍏 macOS
+.DS_Store
+
+# 📊 Streamlit logs
+.streamlit/
+
+# 🧪 Testing artifacts
+*.log
+coverage/
