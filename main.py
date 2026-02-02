@@ -1,6 +1,6 @@
 import os, datetime, requests
 from dotenv import load_dotenv
-from typing import TypedDict, Dict, Any
+from typing import TypedDict, Dict, Any, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers.string import StrOutputParser
@@ -10,6 +10,18 @@ from langchain.memory import ConversationBufferMemory
 from langchain_community.utilities.openweathermap import OpenWeatherMapAPIWrapper
 from langchain_community.utilities import SerpAPIWrapper
 from serpapi import GoogleSearch
+
+# Security imports
+from security.output.safe_parser import SafeParser
+from security.input.validator import (
+    InputValidator,
+    ExtractedTravelInfo,
+    RefinedTravelInfo
+)
+from security.prompt.hardened_templates import HardenedPromptTemplates
+from security.output.pii_detector import PIIDetector
+from security.logging.security_logger import SecurityLogger, SecurityEventType
+from security.middleware import SecurityMiddleware
 
 # ENV
 load_dotenv()
@@ -28,9 +40,18 @@ memory = ConversationBufferMemory(return_messages=True)
 weather_util = OpenWeatherMapAPIWrapper()
 search_util = SerpAPIWrapper()
 
+# Security components
+security_logger = SecurityLogger()
+safe_parser = SafeParser(logger=security_logger)
+pii_detector = PIIDetector(logger=security_logger)
+security_middleware = SecurityMiddleware(logger=security_logger)
+
 # State
 class TravelPlannerState(TypedDict, total=False):
     user_input: str
+    session_id: str
+    security_passed: bool
+    security_block_reason: Optional[str]
     departure_city: str
     destination_country: str
     preferences: str
@@ -93,6 +114,12 @@ def estimate_flight_cost(departure_city: str, destination_city: str, outbound_da
             }
         return all_flights_data
     except Exception as e:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id="flight_tool",
+            details={"error": str(e)},
+            severity="error"
+        )
         return {"error": str(e)}
 
 
@@ -148,15 +175,14 @@ def estimate_hotel_cost(city: str, check_in: str, check_out: str) -> dict:
 
         return all_hotels_data
     except Exception as e:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id="hotel_tool",
+            details={"error": str(e)},
+            severity="error"
+        )
         return {"error": str(e)}
 
-
-import os
-import requests
-from dotenv import load_dotenv
-from langchain_core.tools import tool
-
-load_dotenv()  # Load API keys from .env
 
 @tool
 def get_weather_forecast(city: str, days: int = 7) -> str:
@@ -189,12 +215,18 @@ def get_weather_forecast(city: str, days: int = 7) -> str:
             max_temp = day["day"]["maxtemp_c"]
             min_temp = day["day"]["mintemp_c"]
             forecast_lines.append(
-                f"{date}: High {max_temp}°C / Low {min_temp}°C – {condition}"
-            ) 
+                f"{date}: High {max_temp}C / Low {min_temp}C - {condition}"
+            )
 
         return "\n".join(forecast_lines)
 
     except Exception as e:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id="weather_tool",
+            details={"error": str(e)},
+            severity="error"
+        )
         return f"Error retrieving weather: {str(e)}"
 
 
@@ -214,41 +246,25 @@ def search_places(query: str) -> str:
         data = response.json()
         results = data.get("organic_results", [])
         return "\n".join(
-            f"🔹 {place.get('title')}\n_{place.get('snippet')}_\n[More info]({place.get('link')})"
+            f"* {place.get('title')}\n_{place.get('snippet')}_\n[More info]({place.get('link')})"
             for place in results
         )
-    except Exception:
+    except Exception as e:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id="places_tool",
+            details={"error": str(e)},
+            severity="error"
+        )
         return "Error fetching places."
 
 
-# ---------------- PROMPT CHAINS -------------------
+# ---------------- PROMPT CHAINS (using hardened templates) -------------------
 
-info_extraction_prompt = ChatPromptTemplate.from_template("""
-You're a helpful assistant. From:
-"{input}"
-Extract JSON:
-- departure_city
-- destination_country
-- preferences
-- budget
-- outbound_date
-- return_date
-Leave missing values as empty strings.
-""")
+info_extraction_prompt = HardenedPromptTemplates.get_info_extraction_prompt()
 extract_info_chain = info_extraction_prompt | llm | parser
 
-refine_prompt = ChatPromptTemplate.from_template("""
-Refine travel plan:
-From: {departure_city}
-To: {destination_country}
-Dates: {outbound_date} → {return_date}
-Budget: {budget}
-Preferences: {preferences}
-Return JSON with:
-- destination_city
-- arrival_airport
-- notes
-""")
+refine_prompt = HardenedPromptTemplates.get_refine_prompt()
 refine_chain = refine_prompt | llm | parser
 
 
@@ -272,49 +288,18 @@ def get_cost_breakdown(city: str, preferences: str) -> str:
             if snippet:
                 return snippet
     except Exception as e:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id="cost_tool",
+            details={"error": str(e)},
+            severity="error"
+        )
         return f"Could not fetch cost breakdown due to error: {str(e)}"
-    
+
     return "No detailed cost breakdown found for the specified city and travel preference."
 
 
-
-misc_cost_prompt = ChatPromptTemplate.from_template("""
-You are a financial assistant helping a tourist plan costs for a trip.
-
-Below is a snippet from a travel article or estimate:
-\"\"\"{snippet}\"\"\"
-
-The traveler prefers a **{preference}** style trip.
-
-Based on this, provide a daily cost estimate (in USD) broken down into:
-
-- Food
-- Transportation
-- Shopping
-- Paid Attractions
-- Car Rentals
-- Other
-
-Adjust the cost ranges based on the preference (e.g., lower for low-budget, higher for luxury).
-
-Return a human-readable summary like:
-
----
-🧾 Estimated Daily Costs (for a {preference} trip):
-
-- 🍽️ Food: $30
-- 🚕 Transportation: $15
-- 🛍️ Shopping: $25
-- 🎟️ Paid Attractions: $20
-- 🚗 Car Rentals: $40
-- 🧩 Other: $10
-
-🔢 Total Miscellaneous Daily Cost: $140
----
-
-If any category is not mentioned, estimate it reasonably based on typical travel costs.
-""")
-
+misc_cost_prompt = HardenedPromptTemplates.get_misc_cost_prompt()
 misc_cost_chain = misc_cost_prompt | llm | StrOutputParser()
 
 
@@ -328,7 +313,7 @@ def calculate_total_budget(state: TravelPlannerState, serpapi_snippet: str) -> s
     end = datetime.datetime.strptime(state["return_date"], "%Y-%m-%d")
     days = max((end - start).days, 1)
 
-    # 1️⃣ Flight range
+    # 1. Flight range
     flight_prices = [
         float(str(f.get("price", "")).replace("$", "").replace(",", ""))
         for f in state.get("flight", {}).values()
@@ -338,7 +323,7 @@ def calculate_total_budget(state: TravelPlannerState, serpapi_snippet: str) -> s
     max_flight = max(flight_prices) if flight_prices else 0
     avg_flight = mean(flight_prices) if flight_prices else 0
 
-    # 2️⃣ Hotel range
+    # 2. Hotel range
     hotel_prices = [
         float(str(h.get("price_per_night", "")).replace("$", "").replace(",", ""))
         for h in state.get("hotel", {}).values()
@@ -350,19 +335,26 @@ def calculate_total_budget(state: TravelPlannerState, serpapi_snippet: str) -> s
     hotel_total = avg_hotel * days
 
     llm_response = misc_cost_chain.invoke({
-        "snippet": serpapi_snippet,
+        "snippet": HardenedPromptTemplates.sanitize_for_prompt(serpapi_snippet),
         "preference": state.get("preferences", "mid-range")
     })
 
-    # 🧾 Final message string
+    # Extract daily cost from LLM response
+    try:
+        cost_match = re.search(r"\$([0-9,]+)", llm_response)
+        daily_misc = float(cost_match.group(1).replace(',', '')) if cost_match else 100
+    except (AttributeError, ValueError):
+        daily_misc = 100  # Default fallback
+
+    # Final message string
     message = f"""\
-    Flight Cost Range: ${min_flight} – ${max_flight}  
-    Hotel (per night): ${min_hotel} – ${max_hotel}  
-    Trip Length: {days} nights  
-    
-    Hotel Total: ${hotel_total}  
-    Miscellaneous Daily Cost: {llm_response}  
-    Total Estimated Cost: ${min_flight + hotel_total + days * float(re.search(r"\$([0-9,]+)", llm_response).group(1).replace(',', ''))} – ${max_flight + hotel_total + days * float(re.search(r"\$([0-9,]+)", llm_response).group(1).replace(',', ''))}         
+    Flight Cost Range: ${min_flight} - ${max_flight}
+    Hotel (per night): ${min_hotel} - ${max_hotel}
+    Trip Length: {days} nights
+
+    Hotel Total: ${hotel_total}
+    Miscellaneous Daily Cost: {llm_response}
+    Total Estimated Cost: ${min_flight + hotel_total + days * daily_misc} - ${max_flight + hotel_total + days * daily_misc}
     """
     return message
 
@@ -370,52 +362,126 @@ def calculate_total_budget(state: TravelPlannerState, serpapi_snippet: str) -> s
 
 # ---------------- ITINERARY GENERATION ----------------
 
-itinerary_prompt = ChatPromptTemplate.from_template("""
-You are a professional travel planner.
-
-Using the information below, create a personalized, detailed **day-by-day travel itinerary** for the user:
-
-- **Departure City:** {departure_city}  
-- **Destination Country:** {destination_country}  
-- **Destination City:** {destination_city}  
-- **Travel Dates:** {outbound_date} to {return_date}  
-- **Budget Details:** {total}  
-- **User Preferences:** {preferences}  
-- **Additional Notes:** {notes}  
-- **Weather Forecast:** {weather}  
-- **Top Attractions:** {places}  
-- **Flight Options:** {flight}  
-- **Hotel Options:** {hotel}  
-
-Your response must:
-
-1. Present a structured itinerary for each day (including suggested activities and places).
-2. Incorporate relevant **weather conditions** for each day.
-3. List all the **best flight and hotel** options from the provided data.
-4. Ensure alignment with the user's **budget** and **preferences** (e.g. low-budget, luxury).
-5. Briefly summarize expected total cost and how the itinerary fits that budget.
-
-Format the response clearly using bullet points or headings per day.
-
-""")
+itinerary_prompt = HardenedPromptTemplates.get_itinerary_prompt()
 itinerary_chain = itinerary_prompt | llm | parser
 
 # ---------------- GRAPH NODES ----------------
 
+def security_gate(state: TravelPlannerState) -> TravelPlannerState:
+    """
+    Security gate node - runs security checks on user input.
+    This is the entry point of the graph.
+    """
+    session_id = state.get("session_id", "unknown")
+    user_input = state.get("user_input", "")
+
+    # Run security middleware checks
+    security_result = security_middleware.check(
+        user_input=user_input,
+        session_id=session_id,
+        skip_topic_check=False  # Enforce travel-related topics
+    )
+
+    if security_result.is_allowed:
+        state["security_passed"] = True
+        state["user_input"] = security_result.sanitized_input
+        security_logger.log_security_gate(session_id, passed=True)
+    else:
+        state["security_passed"] = False
+        state["security_block_reason"] = security_result.block_reason
+        security_logger.log_security_gate(
+            session_id,
+            passed=False,
+            block_reason=security_result.block_reason
+        )
+
+    return state
+
+
+def blocked_response(state: TravelPlannerState) -> TravelPlannerState:
+    """
+    Handle blocked requests with a safe response.
+    """
+    block_reason = state.get("security_block_reason", "Security check failed")
+    state["itinerary"] = f"I'm sorry, but I couldn't process your request. {block_reason}. Please try rephrasing your travel query."
+    return state
+
+
 def extract_info(state: TravelPlannerState) -> TravelPlannerState:
-    result = extract_info_chain.invoke({"input": state["user_input"]})
-    info = eval(result)
+    """Extract travel information from user input using safe parsing."""
+    session_id = state.get("session_id", "unknown")
+
+    # Sanitize input for prompt
+    sanitized_input = HardenedPromptTemplates.sanitize_for_prompt(state["user_input"])
+    result = extract_info_chain.invoke({"input": sanitized_input})
+
+    # Use safe parser instead of eval()
+    parse_result = safe_parser.parse_json(result, session_id)
+
+    if parse_result.success and parse_result.data:
+        # Validate against schema
+        is_valid, validated, error = InputValidator.validate_extracted_info(parse_result.data)
+
+        if is_valid and validated:
+            info = validated.model_dump()
+        else:
+            security_logger.log_event(
+                event_type=SecurityEventType.OUTPUT_VALIDATION,
+                session_id=session_id,
+                details={"validation_error": error},
+                severity="warning"
+            )
+            info = parse_result.data  # Use unvalidated data as fallback
+    else:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id=session_id,
+            details={"parse_error": parse_result.error},
+            severity="warning"
+        )
+        info = {}
+
     for key in ["departure_city", "destination_country", "preferences", "budget", "outbound_date", "return_date"]:
         state[key] = info.get(key, "") or state.get(key, "")
     return state
 
+
 def plan_node(state: TravelPlannerState) -> TravelPlannerState:
+    """Refine travel plan using safe parsing."""
+    session_id = state.get("session_id", "unknown")
     result = refine_chain.invoke(state)
-    update = eval(result)
+
+    # Use safe parser instead of eval()
+    parse_result = safe_parser.parse_json(result, session_id)
+
+    if parse_result.success and parse_result.data:
+        # Validate against schema
+        is_valid, validated, error = InputValidator.validate_refined_info(parse_result.data)
+
+        if is_valid and validated:
+            update = validated.model_dump()
+        else:
+            security_logger.log_event(
+                event_type=SecurityEventType.OUTPUT_VALIDATION,
+                session_id=session_id,
+                details={"validation_error": error},
+                severity="warning"
+            )
+            update = parse_result.data
+    else:
+        security_logger.log_event(
+            event_type=SecurityEventType.OUTPUT_VALIDATION,
+            session_id=session_id,
+            details={"parse_error": parse_result.error},
+            severity="warning"
+        )
+        update = {}
+
     state["destination_city"] = update.get("destination_city", state["destination_country"])
     state["arrival_airport"] = update.get("arrival_airport", "")
     state["notes"] = update.get("notes", "")
     return state
+
 
 def flight_step(state: TravelPlannerState) -> TravelPlannerState:
     state["flight"] = estimate_flight_cost.invoke({
@@ -460,17 +526,48 @@ def weather_step(state: TravelPlannerState) -> TravelPlannerState:
     })
     return state
 
+
 def search_step(state: TravelPlannerState) -> TravelPlannerState:
     state["places"] = search_places.invoke({"query": state["destination_city"]})
     return state
 
+
 def itinerary_step(state: TravelPlannerState) -> TravelPlannerState:
-    state["itinerary"] = itinerary_chain.invoke(state)
+    """Generate itinerary with PII detection."""
+    session_id = state.get("session_id", "unknown")
+
+    itinerary = itinerary_chain.invoke(state)
+
+    # Check for PII in output
+    pii_result = pii_detector.detect(itinerary, session_id)
+    if pii_result.contains_pii:
+        security_logger.log_pii_detection(
+            session_id=session_id,
+            entity_types=[e.entity_type for e in pii_result.entities],
+            count=len(pii_result.entities)
+        )
+        # Use anonymized version
+        itinerary = pii_result.anonymized_text or itinerary
+
+    state["itinerary"] = itinerary
     return state
+
 
 # ---------------- LANGGRAPH ----------------
 
+def route_after_security(state: TravelPlannerState) -> str:
+    """Route based on security check result."""
+    if state.get("security_passed", False):
+        return "extract_info"
+    else:
+        return "blocked"
+
+
 graph = StateGraph(TravelPlannerState)
+
+# Add security gate as entry point
+graph.add_node("security_gate", security_gate)
+graph.add_node("blocked", blocked_response)
 graph.add_node("extract_info", extract_info)
 graph.add_node("plan_node", plan_node)
 graph.add_node("flight_step", flight_step)
@@ -480,7 +577,23 @@ graph.add_node("weather_step", weather_step)
 graph.add_node("search_step", search_step)
 graph.add_node("itinerary_step", itinerary_step)
 
-graph.set_entry_point("extract_info")
+# Set security gate as entry point
+graph.set_entry_point("security_gate")
+
+# Add conditional routing after security check
+graph.add_conditional_edges(
+    "security_gate",
+    route_after_security,
+    {
+        "extract_info": "extract_info",
+        "blocked": "blocked"
+    }
+)
+
+# Blocked requests go to END
+graph.add_edge("blocked", END)
+
+# Normal flow
 graph.add_edge("extract_info", "plan_node")
 graph.add_edge("plan_node", "flight_step")
 graph.add_edge("flight_step", "hotel_step")
