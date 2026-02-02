@@ -140,8 +140,8 @@ Travel-Planner/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/abdullahhunjra/ai-travel-assistant-multiagent-orchestration-langchain-langgraph-lcel.git
-cd Travel-Planner
+git clone https://github.com/abdullahhunjra/secure-openai-travel-planner-langchain-langgraph-prompt-injection-protection.git
+cd secure-openai-travel-planner-langchain-langgraph-prompt-injection-protection
 ```
 
 ### 2. Create Virtual Environment
